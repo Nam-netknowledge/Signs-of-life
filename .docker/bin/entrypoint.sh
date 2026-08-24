@@ -12,6 +12,10 @@ CONTAINER_NAME=$(hostname)
 crawl_dir () {
     for file in $PROCCESS_DIR
     do
+        # unquoted glob with no match expands to the literal pattern string;
+        # skip that case instead of trying to process a nonexistent file
+        # (this script runs under /bin/sh, so 'shopt -s nullglob' isn't available here)
+        [ -e "$file" ] || continue
         echo -e "\n\n*****************\n\n"
         echo -e "* ${BLUE}Input file found [${file}]${NC}";
         #
@@ -52,11 +56,13 @@ crawl_dir () {
 }
 
 main () {
-   echo -e "* ${BLUE}Looking for input files to Crawl in [${PROCCESS_DIR}].${NC}";
-   crawl_dir
-   echo -e "* ${BLUE}Done Crawling. Going to Sleep.....${NC}";
-   sleep 60s  
-   main
+   while true
+   do
+       echo -e "* ${BLUE}Looking for input files to Crawl in [${PROCCESS_DIR}].${NC}";
+       crawl_dir
+       echo -e "* ${BLUE}Done Crawling. Going to Sleep.....${NC}";
+       sleep 60s
+   done
 }
 
 echo -e "* ${BLUE}Starting the Crawler. ID: ${CONTAINER_NAME}${NC}";

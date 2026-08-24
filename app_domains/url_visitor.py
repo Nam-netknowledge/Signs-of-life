@@ -1,7 +1,9 @@
 """Script handling Python and Chrome visit of a domain + Visit of redirected pages orchestration"""
 
+import json
 import re
 import socket
+import zlib
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -11,6 +13,7 @@ from pathlib import Path
 import time
 import random
 from random import shuffle
+import threading
 from concurrent import futures
 from datetime import datetime
 import asyncio
@@ -19,6 +22,7 @@ import aiohttp
 from aiohttp import ClientSession
 import asyncpool
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 import tracemalloc
 
 from config import RUN_CONFIG
@@ -111,7 +115,46 @@ log_manager.addHandler(handler)
 log_manager.setLevel(logging.WARNING)
 
 USER_AGENT = RUN_CONFIG["USER_AGENT"]
-LOADING_TIME = 15  # 15 seconds to interpret the full page
+LOADING_TIME = RUN_CONFIG["RENDER_TIMEOUT_SECONDS"]  # seconds to interpret the full page (WAVE 4: was a hardcoded 15)
+
+# ANTI-BLOCKING: browser-like headers sent alongside a rotated User-Agent
+# (see ENABLE_UA_ROTATION in config.py). User-Agent itself is added per-request
+# by pick_user_agent() below.
+BROWSER_LIKE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    # NOT advertising "br" (Brotli): this image's aiohttp has no brotli decoder
+    # installed, so a server that took us up on it fails with
+    # "Can not decode content-encoding: brotli (br)" -- a self-inflicted 400
+    # that's worse than the block we're trying to fix. gzip/deflate only.
+    "Accept-Encoding": "gzip, deflate",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# Cloudflare edge-error statuses treated the same as 503 for short-backoff retries
+CLOUDFLARE_RETRY_STATUSES = {503, 520, 521, 522, 523, 524, 525, 526, 527, 530}
+
+
+def pick_user_agent(domain):
+    """Deterministically pick a UA from the pool so a domain's own retries
+    (and any later re-run of the same domain) stay on the same UA."""
+    pool = RUN_CONFIG["UA_POOL"]
+    idx = zlib.crc32(domain.encode("utf-8")) % len(pool)
+    return pool[idx]
+
+
+def request_headers_for(domain):
+    """Build the per-request header set for a domain, or None to fall back to
+    the session's static default User-Agent (ENABLE_UA_ROTATION off)."""
+    if not RUN_CONFIG["ENABLE_UA_ROTATION"]:
+        return None
+    headers = dict(BROWSER_LIKE_HEADERS)
+    headers["User-Agent"] = pick_user_agent(domain)
+    return headers
 
 DEFAULT_BOOLEAN_VALUES = {
     "to_sample": False,
@@ -374,9 +417,7 @@ class FileData:
                             }
             for addit, value in doc.other_variables.items():
                 if RUN_CONFIG["DO_HCJ_EXTRACTION"] and addit in [CL_HDRS, CL_COOKS]:
-                    # for hdr, hdr_val in value.items():
-                    #     dict_to_save[hdr] =  hdr_val
-                    pass
+                    dict_to_save[addit] = json.dumps(value)
 
                 elif (not addit.startswith("cookie")) and (not addit.startswith("Header")) and (addit != "non_text"):
                     dict_to_save[addit] = value
@@ -483,96 +524,111 @@ async def main_async_batch_visit(dict_unique, loop, do_sampling):
     await connector.close()
 
 
-async def single_url_visit(domain, session, do_sampling):
-    """
-    Launch one HTTP request to one domain
-    """
-    url = domain["url"]
-    if RUN_CONFIG["DEBUG_PRINT"]:
-        print("Starting url: {}".format(url))
-    ts = time.time()
-    wb = Website(url)
+# WAVE 5: transient connection-level failures worth a backoff-and-retry
+# before being classified as final -- excludes DNS resolution error (genuinely
+# dead domain, not transient) and TimeoutError (already burned the full
+# request timeout budget once).
+RETRYABLE_CONNECTION_COMMENTS = {"Connection error", "ServerDisconnected", "Connection closed"}
+
+
+async def _attempt_single_url_request(url, wb, session, enable_revisiting):
+    """One HTTP request attempt for a URL. Mutates wb with error state (is_error/
+    comment/to_revisit) on failure. Returns the response page dict on success,
+    or None on failure."""
     page = None
-    enable_revisiting = RUN_CONFIG["ENABLE_REVISITING"]
-
-    # select for sampling
-    if do_sampling:  # explicit entry so we only do this once per run
-        if random.random() < RUN_CONFIG['SAMPLING_RATE']:
-            wb.other_variables["to_sample"] = True
-            sam_plog.it(f"Selected for sampling : {domain['url']}")
-
-    # hash naming by original url (for redirection targets)
-    if ("original_url" in domain.keys()) and (domain["original_url"] is not None):
-        save_path = RUN_CONFIG["PATH_URL_REVISIT_SAVE"]
-        ref_url = domain["original_url"]
-        wb.other_variables["original_url"] = ref_url
-    else:
-        save_path = RUN_CONFIG["PATH_URL_SAVE"]
-        ref_url = url
-    url_result_name = convert_idna(ref_url)
-
-    # request URL page
     try:
         full_url = url
         if re.search("^https*:", full_url, re.IGNORECASE) is None:
             full_url = "http://" + url
 
         max_range_bytes = RUN_CONFIG["MAX_MB_SINGLE_URL"] * 1024 * 1024 - 10
-        async with session.get(full_url, timeout=RUN_CONFIG["MINUTES_TO_TIMEOUT"] * 60) as response:
-            # OBTAIN HEADER CONTENT-LENGTH TO CHECK SIZE BEFORE RETRIEVING ENTIRE OBJECT
-            content_length = response.headers.get('Content-Length')
+        req_headers = request_headers_for(url)
+        retries_429 = 0
+        retries_5xx = 0
 
-            if RUN_CONFIG["DO_HCJ_EXTRACTION"]:  # get cookies & headers
-                dico_hd = {}
-                for k, v in dict(response.headers).items():
-                    if normalize_hcj_value(k) in SET_ALL_CONSIDERED_HDS:
-                        dico_hd[PREF_HDRS + k] = 1
-                wb.other_variables[CL_HDRS] = dico_hd
+        while True:
+            async with session.get(full_url, timeout=RUN_CONFIG["MINUTES_TO_TIMEOUT"] * 60,
+                                   headers=req_headers) as response:
+                # ANTI-BLOCKING: retry 429 (honoring Retry-After when present) and
+                # 503/Cloudflare edge errors with short backoff, before accepting
+                # this response as final. Does not raise overall concurrency --
+                # only this domain's own request is delayed.
+                delay = None
+                if response.status == 429 and retries_429 < RUN_CONFIG["MAX_RETRIES_429"]:
+                    retries_429 += 1
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = None  # HTTP-date form: fall back to backoff below
+                    if delay is None:
+                        delay = RUN_CONFIG["BACKOFF_BASE_SECONDS"] * (2 ** (retries_429 - 1))
+                elif response.status in CLOUDFLARE_RETRY_STATUSES and retries_5xx < RUN_CONFIG["MAX_RETRIES_5XX"]:
+                    retries_5xx += 1
+                    delay = RUN_CONFIG["BACKOFF_BASE_SECONDS"] * (2 ** (retries_5xx - 1))
 
-                dico_cks = {}
-                for k, v in dict(response.cookies).items():
-                    if normalize_hcj_value(k) in SET_ALL_CONSIDERED_CKS:
-                        dico_cks[PREF_COOK + k] = 1
-                wb.other_variables[CL_COOKS] = dico_cks
+                if delay is not None:
+                    await asyncio.sleep(delay)
+                    continue
 
-            # IF THERE IS CONTENT-LENGTH IN HEADER AND IT IS LESS THAN 5MB
-            if content_length is not None and int(content_length) <= max_range_bytes:
+                # OBTAIN HEADER CONTENT-LENGTH TO CHECK SIZE BEFORE RETRIEVING ENTIRE OBJECT
+                content_length = response.headers.get('Content-Length')
 
-                page = dict()
-                page["text"] = await response.text(errors="ignore")
-                page["url"] = response.url
-                page["history"] = response.history
-                page["status"] = response.status
+                if RUN_CONFIG["DO_HCJ_EXTRACTION"]:  # get cookies & headers
+                    dico_hd = {}
+                    for k, v in dict(response.headers).items():
+                        if normalize_hcj_value(k) in SET_ALL_CONSIDERED_HDS:
+                            dico_hd[PREF_HDRS + k] = 1
+                    wb.other_variables[CL_HDRS] = dico_hd
 
-            # IF THERE IS NO CONTENT-LENGTH IN HEADER
-            elif content_length is None:
-                total_bytes = 0
-                chunks = []
+                    dico_cks = {}
+                    for k, v in dict(response.cookies).items():
+                        if normalize_hcj_value(k) in SET_ALL_CONSIDERED_CKS:
+                            dico_cks[PREF_COOK + k] = 1
+                    wb.other_variables[CL_COOKS] = dico_cks
 
-                # ITERATE PROGRESSIVELY THE RESPONSE CONTENT
-                async for chunk in response.content.iter_any():
+                # IF THERE IS CONTENT-LENGTH IN HEADER AND IT IS LESS THAN 5MB
+                if content_length is not None and int(content_length) <= max_range_bytes:
 
-                    if chunk:
-                        total_bytes += len(chunk)
+                    page = dict()
+                    page["text"] = await response.text(errors="ignore")
+                    page["url"] = response.url
+                    page["history"] = response.history
+                    page["status"] = response.status
 
-                        # CHECK IF LENGTH IS LARGER THAN 5MB
-                        if total_bytes > max_range_bytes:
-                            # SET VALUES TO IGNORE THE DOMAIN
-                            wb.is_error = True
-                            wb.comment = "Page size too large error"
-                            wb.to_revisit = False
-                            break
-                        chunks.append(chunk)
+                # IF THERE IS NO CONTENT-LENGTH IN HEADER
+                elif content_length is None:
+                    total_bytes = 0
+                    chunks = []
 
-                # CHECK IF RESPONSE IN LESS THAN MAX_MB TO LATER PROCESS THE DOMAIN PAGE
-                if total_bytes < max_range_bytes:
-                    async with session.get(full_url, timeout=RUN_CONFIG["MINUTES_TO_TIMEOUT"] * 60) as response:
-                        page = dict()
-                        page["text"] = b"".join(chunks).decode(errors="ignore")
-                        page["url"] = response.url
-                        page["history"] = response.history
-                        page["status"] = response.status
-                        # wb.is_error = False
+                    # ITERATE PROGRESSIVELY THE RESPONSE CONTENT
+                    async for chunk in response.content.iter_any():
+
+                        if chunk:
+                            total_bytes += len(chunk)
+
+                            # CHECK IF LENGTH IS LARGER THAN 5MB
+                            if total_bytes > max_range_bytes:
+                                # SET VALUES TO IGNORE THE DOMAIN
+                                wb.is_error = True
+                                wb.comment = "Page size too large error"
+                                wb.to_revisit = False
+                                break
+                            chunks.append(chunk)
+
+                    # CHECK IF RESPONSE IN LESS THAN MAX_MB TO LATER PROCESS THE DOMAIN PAGE
+                    if total_bytes < max_range_bytes:
+                        async with session.get(full_url, timeout=RUN_CONFIG["MINUTES_TO_TIMEOUT"] * 60,
+                                               headers=req_headers) as response:
+                            page = dict()
+                            page["text"] = b"".join(chunks).decode(errors="ignore")
+                            page["url"] = response.url
+                            page["history"] = response.history
+                            page["status"] = response.status
+                            # wb.is_error = False
+
+                break
 
     # Catching errors
     except aiohttp.client.ClientConnectorError as e:
@@ -637,6 +693,61 @@ async def single_url_visit(domain, session, do_sampling):
             wb.to_revisit = enable_revisiting
         else:
             wb.to_revisit = False
+
+    return page
+
+
+async def single_url_visit(domain, session, do_sampling):
+    """
+    Launch one HTTP request to one domain
+    """
+    url = domain["url"]
+    if RUN_CONFIG["DEBUG_PRINT"]:
+        print("Starting url: {}".format(url))
+    ts = time.time()
+    wb = Website(url)
+    page = None
+    enable_revisiting = RUN_CONFIG["ENABLE_REVISITING"]
+
+    # select for sampling
+    if do_sampling:  # explicit entry so we only do this once per run
+        if random.random() < RUN_CONFIG['SAMPLING_RATE']:
+            wb.other_variables["to_sample"] = True
+            sam_plog.it(f"Selected for sampling : {domain['url']}")
+
+    # hash naming by original url (for redirection targets)
+    if ("original_url" in domain.keys()) and (domain["original_url"] is not None):
+        save_path = RUN_CONFIG["PATH_URL_REVISIT_SAVE"]
+        ref_url = domain["original_url"]
+        wb.other_variables["original_url"] = ref_url
+    else:
+        save_path = RUN_CONFIG["PATH_URL_SAVE"]
+        ref_url = url
+    url_result_name = convert_idna(ref_url)
+
+    # request URL page
+    # WAVE 5: backoff-and-retry transient connection-level failures (raised as
+    # exceptions before any response is received) within this same request,
+    # instead of immediately classifying on the first refused/reset/dropped
+    # connection -- these are frequently transient (momentarily overloaded
+    # host, brief network blip) and a zero-delay retry (the old behaviour,
+    # via to_revisit + the outer per-file revisit pass) rarely gives them
+    # enough time to clear. DNS errors and request-timeout are excluded from
+    # retry (see RETRYABLE_CONNECTION_COMMENTS / MAX_RETRIES_CONNECTION).
+    connection_retries = 0
+    while True:
+        wb.is_error = None
+        wb.comment = None
+        wb.to_revisit = False
+        page = await _attempt_single_url_request(url, wb, session, enable_revisiting)
+
+        if (wb.comment in RETRYABLE_CONNECTION_COMMENTS
+                and connection_retries < RUN_CONFIG["MAX_RETRIES_CONNECTION"]):
+            connection_retries += 1
+            delay = RUN_CONFIG["BACKOFF_BASE_SECONDS"] * (2 ** (connection_retries - 1))
+            await asyncio.sleep(delay)
+            continue
+        break
 
     if not wb.is_error:
         wb = complete_data_of_successful_requests(page, wb)
@@ -748,8 +859,23 @@ def single_url_browser_visit(link, webdriver):
     # loading timeout
     webdriver.implicitly_wait(LOADING_TIME)  # wait for full loading
 
-    # visit url
-    webdriver.get(full_url)
+    # visit url -- explicitly caught: a render timeout must not be a hard
+    # classification (WAVE 4), it just means we couldn't get a page this time
+    try:
+        webdriver.get(full_url)
+    except TimeoutException:
+        resu.is_error = True
+        # "TimeoutError" (not "RENDER_TIMEOUT") deliberately matches
+        # formatting.py's existing ind_timeout regex, so a render timeout lands
+        # in the same undetermined/retry-eligible "Timeout" -> Connection Error
+        # bucket as a request-layer timeout, instead of falling through to the
+        # unrelated "No Status Code" -> Invalid Response catch-all.
+        resu.comment = "TimeoutError: render timeout after RENDER_TIMEOUT_SECONDS"
+        resu.to_revisit = False
+        resu.raw_text = None
+        resu.other_variables["history"] = link.get("history", 0)
+        resu.other_variables["URL_history"] = link.get("URL_history", 0)
+        return resu
 
     # loading timeout
     webdriver.implicitly_wait(0)
@@ -769,8 +895,10 @@ def single_url_browser_visit(link, webdriver):
     resu.comment = None
     resu.to_revisit = False
     resu.raw_text = html
-    resu.other_variables["history"] = link["history"] if hasattr(link, "history") else 0
-    resu.other_variables["URL_history"] = link["URL_history"] if hasattr(link, 'URL_history') else 0
+    # link is a plain dict here, not an object -- hasattr() on it is always False,
+    # so this silently dropped real history/URL_history data on every browser visit
+    resu.other_variables["history"] = link.get("history", 0)
+    resu.other_variables["URL_history"] = link.get("URL_history", 0)
 
     return resu
 
@@ -861,69 +989,107 @@ def get_sample_filenames(url):
 
 
 def single_url_browser_load_visit(link):
-    """Visit one url with Chrome webdriver"""
-    try:
-        if RUN_CONFIG["DEBUG_PRINT"]:
-            print(f"----> START single_url_browser_load_visit {link['url']} <-------")
-        webdriver = initiate_browser_driver()
-        resu = single_url_browser_visit(link, webdriver)
+    """Visit one url with Chrome webdriver.
 
-        # screenshot save
-        if RUN_CONFIG["DO_SAMPLING"] and link['to_sample']:
-            sam_plog.it(f"({link['url']}) | PREPARING FOR SCREENSHOT : {link['ss_filename']}")
-            '''
-            # use a scrolling trick to make sure page has fully loaded before taking the screenshot (so we don't get an empty page)
-            driver.execute_script("""
-                (function () {
-                    var y = 0;
-                    var step = 100;
-                    window.scroll(0, 0);
+    WAVE 4 hardening: the whole visit (driver creation through driver.quit())
+    runs on a background thread with a hard wall-clock join(), instead of
+    directly on this joblib/loky worker. driver.set_page_load_timeout() only
+    bounds webdriver.get() -- if a page leaves the browser session in a bad
+    state (observed live: quit() blocking indefinitely after a broken/slow
+    page), nothing previously stopped that hang from propagating up through
+    Parallel(n_jobs=WORKERS_POST_PROCESSING) in request_full_file_with_browser()
+    and freezing the ENTIRE batch, since Parallel() waits for every dispatched
+    task to return -- one bad domain among many took the whole crawler down
+    for 12+ hours in staging. If the thread hasn't finished within
+    RENDER_TIMEOUT_SECONDS (+ margin for post-load work), we give up on this
+    URL, try to kill the underlying chromedriver process so its resources
+    aren't held forever, and move on -- this URL just comes back with no
+    result (treated like any other failed visit) rather than wedging the pool."""
+    result_holder = {"resu": None}
+    driver_holder = {}
 
-                    function f() {
-                        if (y < document.body.scrollHeight) {
-                            y += step;
-                            window.scroll(0, y);
-                            setTimeout(f, 100);
-                        } else {
-                            window.scroll(0, 0);
-                            document.title += "scroll-done";
+    def _do_visit():
+        try:
+            if RUN_CONFIG["DEBUG_PRINT"]:
+                print(f"----> START single_url_browser_load_visit {link['url']} <-------")
+            webdriver = initiate_browser_driver()
+            driver_holder["webdriver"] = webdriver
+            resu = single_url_browser_visit(link, webdriver)
+
+            # screenshot save
+            if RUN_CONFIG["DO_SAMPLING"] and link['to_sample']:
+                sam_plog.it(f"({link['url']}) | PREPARING FOR SCREENSHOT : {link['ss_filename']}")
+                '''
+                # use a scrolling trick to make sure page has fully loaded before taking the screenshot (so we don't get an empty page)
+                driver.execute_script("""
+                    (function () {
+                        var y = 0;
+                        var step = 100;
+                        window.scroll(0, 0);
+
+                        function f() {
+                            if (y < document.body.scrollHeight) {
+                                y += step;
+                                window.scroll(0, y);
+                                setTimeout(f, 100);
+                            } else {
+                                window.scroll(0, 0);
+                                document.title += "scroll-done";
+                            }
                         }
+
+                        setTimeout(f, 1000);
+                    })();
+                """)
+
+                for i in range(30):
+                    if "scroll-done" in driver.title:
+                        break
+                    time.sleep(1)
+                '''
+                for i in range(30):
+                    if webdriver.execute_script("""document.onreadystatechange = function () {
+                                                   if (document.readyState == "complete") {
+                                                        return "complete";
+                                                    }
+                                                }""") == 'complete':
+                        break
+                    time.sleep(1)
+                total_height = webdriver.execute_script("""
+                    if (document.scrollingElement){
+                        return document.scrollingElement.scrollHeight;
                     }
+                    return document.body.offsetHeight;
+                """)
+                max_height = RUN_CONFIG["SAMPLING_MAX_SCREENSHOT_HEIGHT_PX"]
+                webdriver.set_window_size(1200, total_height if total_height <= max_height else max_height)
+                webdriver.save_screenshot(link['ss_filename'])
+                sam_plog.it(f"({link['url']}) | SCREENSHOT SAVED")
 
-                    setTimeout(f, 1000);
-                })();
-            """)
+            webdriver.quit()
+            result_holder["resu"] = resu
 
-            for i in range(30):
-                if "scroll-done" in driver.title:
-                    break
-                time.sleep(1)
-            '''
-            for i in range(30):
-                if webdriver.execute_script("""document.onreadystatechange = function () {
-                                               if (document.readyState == "complete") {
-                                                    return "complete";
-                                                }
-                                            }""") == 'complete':
-                    break
-                time.sleep(1)
-            total_height = webdriver.execute_script("""
-                if (document.scrollingElement){
-                    return document.scrollingElement.scrollHeight;
-                } 
-                return document.body.offsetHeight;
-            """)
-            max_height = RUN_CONFIG["SAMPLING_MAX_SCREENSHOT_HEIGHT_PX"]
-            webdriver.set_window_size(1200, total_height if total_height <= max_height else max_height)
-            webdriver.save_screenshot(link['ss_filename'])
-            sam_plog.it(f"({link['url']}) | SCREENSHOT SAVED")
+        except Exception as e:
+            print("JS error with {} of type: {} : {} --> js interpretation removed".format(link["url"], type(e), str(e)))
+            # raise
+            result_holder["resu"] = None
 
-        webdriver.quit()
+    visit_thread = threading.Thread(target=_do_visit, daemon=True)
+    visit_thread.start()
+    # margin beyond RENDER_TIMEOUT_SECONDS to allow for post-load extraction/
+    # screenshot work and a normal driver.quit() before declaring it truly stuck
+    visit_thread.join(RUN_CONFIG["RENDER_TIMEOUT_SECONDS"] + 15)
+    if visit_thread.is_alive():
+        print(f"HARD TIMEOUT: {link['url']} browser visit did not return in time -- abandoning and killing driver")
+        stuck_driver = driver_holder.get("webdriver")
+        if stuck_driver is not None:
+            try:
+                stuck_driver.service.process.kill()
+            except Exception:
+                pass
+        return None
 
-    except Exception as e:
-        print("JS error with {} of type: {} : {} --> js interpretation removed".format(link["url"], type(e), str(e)))
-        # raise
-        resu = None
+    resu = result_holder["resu"]
     if RUN_CONFIG["DEBUG_PRINT"]:
         print(f"----> END single_url_browser_load_visit {link['url']}. Got result: {resu is not None} <-------")
     return resu
@@ -945,4 +1111,8 @@ def initiate_browser_driver():
     driver = webdriver.Chrome(chrome_options=options)
     # loading timeout
     driver.implicitly_wait(LOADING_TIME)  # wait for full loading
+    # WAVE 4: page navigation itself previously had no explicit bound (only
+    # implicitly_wait, which governs element lookups, not driver.get() itself),
+    # so a slow page could hang well past LOADING_TIME before failing.
+    driver.set_page_load_timeout(RUN_CONFIG["RENDER_TIMEOUT_SECONDS"])
     return driver

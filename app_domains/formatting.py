@@ -18,7 +18,8 @@ DEBUG_COLUMNS = ["input_url", "final_url", "tld", "category_lv1","category_lv2",
                  "URL_history", "all_status_codes", "history",
                   "registrar_found", "park_service", "kw_parked", "kw_park_notice", "pred_is_empty",
                  "n_letter", "n_words", "flag_js_found", "document_write", "js_or_iframe_found",
-                 "is_js_rendered_results", "flag_iframe", "original_url",
+                 "is_js_rendered_results", "flag_iframe", "original_url", "is_interstitial",
+                 "is_isp_placeholder", "is_archived_redirect",
                  "has_facebook", "has_twitter", "has_linkedin", "has_reddit", "has_instagram", "has_github",
                  "feat_fb_lks", "feat_tw_lks", "feat_lk_lks", "feat_rd_lks", "feat_ig_lks", "feat_gh_lks",
                  "has_open_graph", "has_twitter_card", "has_schema_tag","has_mx_record", "MXRecord", "has_own_mx_record",
@@ -35,13 +36,29 @@ TABLEAU_COLUMNS = ["input_url", "final_url", "tld", "category_lv1","category_lv2
                    "fx_hcj__opti_etag", "fx_hcj__opti_parkingPage", "fx_hcj__techno_ASP", "fx_hcj__techno_PHP",
                    "fx_hcj__techno_AWS", "fx_hcj__techno_Java", "fx_hcj__techno_Jquery", "fx_hcj__techno_React",
                    "fx_hcj__techno_Angular", "fx_hcj__service_adblock", "fx_hcj__service_wix", "fx_hcj__service_shopify",
-                   "fx_hcj__service_shop", "fx_hcj__service_sucuri", "fx_hcj__service_googleAds"
+                   "fx_hcj__service_shop", "fx_hcj__service_sucuri", "fx_hcj__service_googleAds",
+                   "n_words", "n_letter", "ind_non_schema", "park_service", "flag_js_found", "tag_quantity", "URL_history",
+                   "headers", "cookies", "links"
                    ]
+
+# WAVE 6: word-count ceiling for the thin-body 403/429/503 gate below. Picked
+# from canary evidence: still-blocked challenge pages that slipped through
+# the is_interstitial detector topped out at 33 words (mlb.com, aa.com,
+# nba.com, easyjet.com, homedepot.com, imf.org, hm.com); genuine recoveries
+# that still carry an earlier/terminal 403 in all_status_codes (oracle.com,
+# mercedes-benz.com, openai.com, mayoclinic.org, etc.) started at 75 words.
+# 50 sits in the gap with margin on both sides.
+THIN_BLOCKED_PAGE_WORD_THRESHOLD = 50
 
 DICO_NAMING_LV4 = {
     "Other": ["Content", "Low content", "Other"],
     "Parked Notice Registrar": ["Content", "Low content", "Parked Notice Registrar"],
-    "Blocked": ["Content", "Low content", "Blocked"],
+    # WAVE 7: lv3 'bot_blocked' groups every proxy-retryable block flavor (see
+    # also Blocked_Interstitial below) so `WHERE category_lv3 = 'bot_blocked'`
+    # is the Proxyseller re-crawl worklist, regardless of lv1/lv2 bucket. Split
+    # out from origin-down responses (lv3 'unreachable', see Origin_Error)
+    # since no proxy retry fixes a Cloudflare origin-unreachable edge error.
+    "Blocked": ["Content", "Low content", "bot_blocked"],
     "Under construction": ["Content", "Low content", "Upcoming"],
     "Starter": ["Content", "Low content", "Upcoming"],
     "Expired": ["Content", "Low content", "Abandoned"],
@@ -63,6 +80,31 @@ DICO_NAMING_LV4 = {
     "HTTP_504": ["No content", "Errors", "HTTP Error"],
     "HTTP_other": ["No content", "Errors", "HTTP Error"],
     "High content": ["Content", "High content", "High content"],
+    # WAVE 4: distinct from "Blocked" above (Content>Low content>Blocked, for a
+    # page whose OWN content is about being blocked) -- this is for a
+    # Cloudflare/Vercel/etc. challenge or infra-error interstitial, which is not
+    # real content at all. Assigned by a final override in final_parking_naming_v2
+    # that runs after everything else, so it wins over the park/ML classifier.
+    # lv3 'bot_blocked': this is the bot-challenge/rate-limit flavor of
+    # interstitial (403/429/503 status leg, Cloudflare "Just a moment"/
+    # "Attention Required", Vercel Security Checkpoint, Incapsula, or the
+    # thin-body retry-cleared gate) -- see Origin_Error for the origin-down
+    # flavor, which this dict entry no longer covers.
+    "Blocked_Interstitial": ["No content", "Errors", "bot_blocked"],
+    # WAVE 7: Cloudflare "origin server unreachable" edge errors (520-527,
+    # 530 -- ORIGIN_ERROR_STATUS_CODES in config.py). Distinct from
+    # Blocked_Interstitial/bot_blocked because these aren't a bot-detection
+    # response at all -- Cloudflare's edge is up but the origin behind it
+    # isn't, so a proxy retry (which only changes the client's IP/fingerprint)
+    # can't fix it. lv3 'unreachable' keeps these out of the Proxyseller
+    # re-crawl worklist that filters on category_lv3 = 'bot_blocked'.
+    "Origin_Error": ["No content", "Errors", "unreachable"],
+    # WAVE 5: HTTP-200 hosting/ISP default placeholder ("nothing configured
+    # here") -- not a real response, not a park/registrar notice either.
+    "ISP_Placeholder": ["No content", "Errors", "Invalid Response"],
+    # WAVE 5: redirected to a specific archive.org snapshot instead of serving
+    # its own content -- domain is effectively inactive, not "Parked".
+    "Archived_Redirect": ["No content", "Errors", "Inactive"],
 }
 
 def final_parking_naming_v2(df):
@@ -151,7 +193,36 @@ def final_parking_naming_v2(df):
     # EMPTY
     ind_blank_page = df["pred_is_empty"] & (~df["flag_js_found"]) & (~ind_ml_pred_park) & (~ind_registrar) & (
         ~ind_error)
-    ind_blank_page = ind_blank_page | (ind_ml_other & df["pred_is_empty"])
+    # FIX (post-Wave4 validation): this used to also fire whenever
+    # (ind_ml_other & pred_is_empty), i.e. it would override an ind_ml_other
+    # page (a positive ML park-pattern detection, itself gated on
+    # ind_ml_pred_park) back to "Blank Page" purely because pred_is_empty was
+    # also true -- which happens for any page at/under EMPTY_WORD_THRESHOLD
+    # words. Same bug as the word-count floor below: a positive parking
+    # detection must win over the low-word-count rule, not get silently
+    # re-overridden by it. ind_ml_other already requires ind_ml_pred_park,
+    # which the line above already excludes -- so this clause is simply
+    # removed rather than reintroducing the override.
+
+    # WAVE 4: unconditional word-count floor -- overrides flag_js_found/iframe,
+    # since a page with this few visible words can't be meaningful content
+    # regardless of what those signals say (config: EMPTY_WORD_THRESHOLD). This
+    # is what routes the image-based .sydney parking cluster (flag_js_found=True,
+    # ~8 words) to empty/not-used instead of High content.
+    # FIX (post-Wave4 validation): this must NOT override a positive registrar
+    # or ML park-pattern detection -- those are affirmative signals that the
+    # low word count IS the meaningful content (e.g. a one-line "domain is for
+    # sale" registrar landing page, or a short parked-notice page), so they
+    # take precedence over the floor just like the original ind_blank_page
+    # above already excludes them via ~ind_registrar / ~ind_ml_pred_park.
+    # Without these exclusions, low-word registrar/parked pages were getting
+    # tagged "Parked Notice Registrar"/"Parked Notice Individual Content" at
+    # line ~190/199 and then silently overwritten to "Blank Page" here.
+    if RUN_CONFIG["ENABLE_EMPTY_WORD_FLOOR"] and "n_words" in set_cols:
+        n_words_numeric = pd.to_numeric(df["n_words"], errors="coerce")
+        ind_word_floor_empty = (n_words_numeric <= RUN_CONFIG["EMPTY_WORD_THRESHOLD"]) & (~ind_error) & (
+            ~ind_registrar) & (~ind_ml_pred_park)
+        ind_blank_page = ind_blank_page | ind_word_floor_empty
 
     # results
     df.loc[ind_cat_401_2, "category_lv4"] = "HTTP_401"
@@ -183,6 +254,79 @@ def final_parking_naming_v2(df):
 
     ind_normal = df["category_lv4"].isnull()
     df.loc[ind_normal, "category_lv4"] = "High content"
+
+    # WAVE 4: interstitial/infra gate override -- applied last so it wins over
+    # every other rule above (HTTP-status buckets, park/ML classifier incl.
+    # ml_feat_blocked, empty-page floor, High content fallback). This is the
+    # override is_interstitial is meant to key off of; without it a page caught
+    # by detect_interstitial() falls through to whatever ind_error-based rule
+    # happens to match its comment text (e.g. "No Status Code"/Invalid Response)
+    # instead of the dedicated Blocked/Undetermined bucket.
+    # WAVE 5: same "applied last, wins over everything" reasoning as the
+    # interstitial override above -- an ISP placeholder or archive.org
+    # redirect must not fall through to Parked Notice Registrar/Individual
+    # Content or High content just because it also happens to match one of
+    # those rules' signals.
+    if "is_isp_placeholder" in set_cols:
+        ind_isp_placeholder = df["is_isp_placeholder"].apply(lambda x: str(x) in ["TRUE", True, "True"])
+        df.loc[ind_isp_placeholder, "category_lv4"] = "ISP_Placeholder"
+
+    if "is_archived_redirect" in set_cols:
+        ind_archived_redirect = df["is_archived_redirect"].apply(lambda x: str(x) in ["TRUE", True, "True"])
+        df.loc[ind_archived_redirect, "category_lv4"] = "Archived_Redirect"
+
+    if "is_interstitial" in set_cols:
+        ind_interstitial = df["is_interstitial"].apply(lambda x: str(x) in ["TRUE", True, "True"])
+        df.loc[ind_interstitial, "category_lv4"] = "Blocked_Interstitial"
+
+    # WAVE 6: thin-body bot-blocked-status gate -- independent of the
+    # comment-derived ind_cat_403 etc. above (which only fire when the
+    # "status code: NNN" text is present in `comment`) and independent of
+    # is_interstitial (a content-pattern detector that doesn't catch every
+    # case). Wave 3's retry/backoff can clear the error comment on a request
+    # that still terminates on a bot-blocked status, leaving a thin
+    # interstitial/challenge page that satisfies none of the rules above and
+    # falls through to "High content". `all_status_codes` is built in
+    # url_visitor.py as [terminal status] + [redirect history], so the first
+    # token is the actual final status regardless of how many redirects
+    # preceded it.
+    # WAVE 7: scoped to RUN_CONFIG["BOT_BLOCKED_STATUS_CODES"] (403/429/503)
+    # only, not the old combined list -- an origin-down terminal status
+    # (520-527/530) is handled unconditionally by the Origin_Error gate right
+    # below, which doesn't need (and shouldn't have) this word-count gate:
+    # unlike a 403/429/503, there's no "genuine recovery that still shows an
+    # earlier origin error in its history" case to guard against, since a
+    # *terminal* origin-error status means the origin was down for the
+    # response actually served.
+    # Applied last, like the overrides above, so it wins over "High content";
+    # gated on word count so genuine recoveries that still show a bot-blocked
+    # status in their history aren't caught (see THIN_BLOCKED_PAGE_WORD_THRESHOLD).
+    terminal_status = pd.Series("", index=df.index)
+    if "all_status_codes" in set_cols:
+        terminal_status = df["all_status_codes"].apply(
+            lambda x: str(x).split("_")[0] if pd.notnull(x) and str(x) != "" else "")
+
+    if "all_status_codes" in set_cols and "n_words" in set_cols:
+        bot_blocked_status_strs = [str(c) for c in RUN_CONFIG["BOT_BLOCKED_STATUS_CODES"]]
+        ind_terminal_bot_blocked_status = terminal_status.isin(bot_blocked_status_strs)
+        n_words_numeric = pd.to_numeric(df["n_words"], errors="coerce")
+        ind_thin_body = n_words_numeric <= THIN_BLOCKED_PAGE_WORD_THRESHOLD
+        df.loc[ind_terminal_bot_blocked_status & ind_thin_body, "category_lv4"] = "Blocked_Interstitial"
+
+    # WAVE 7: origin-down gate -- terminal status is one of Cloudflare's own
+    # "origin server unreachable" edge errors (RUN_CONFIG["ORIGIN_ERROR_STATUS_CODES"]:
+    # 520-527/530). Unconditional (no word-count gate, doesn't require
+    # is_interstitial) because a *terminal* origin-error status is
+    # authoritative on its own -- Cloudflare's edge served that status as the
+    # final response, so there's no "genuine recovery" ambiguity the way
+    # there is for 403/429/503 above. Applied last of all the override gates
+    # so it wins over Blocked_Interstitial, the thin-body gate, HTTP_other,
+    # and High content alike -- this is what keeps 52x/530 out of the
+    # `category_lv3 = 'bot_blocked'` Proxyseller re-crawl worklist.
+    if "all_status_codes" in set_cols:
+        origin_error_status_strs = [str(c) for c in RUN_CONFIG["ORIGIN_ERROR_STATUS_CODES"]]
+        ind_terminal_origin_error = terminal_status.isin(origin_error_status_strs)
+        df.loc[ind_terminal_origin_error, "category_lv4"] = "Origin_Error"
 
     df["category_lv1"] = df["category_lv4"].apply(lambda x:DICO_NAMING_LV4[x][0])
     df["category_lv2"] = df["category_lv4"].apply(lambda x:DICO_NAMING_LV4[x][1])

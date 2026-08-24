@@ -18,9 +18,9 @@ RUN_CONFIG = {
     # "input_folder": join(MAIN_DIR, "input", "com10k"),
 
     # Max number of domains the controller can handle in one go.
-    "CONTROLLER_LIMIT": 10000,  # Files will be split into these chunks before being fed to the controller
+    "CONTROLLER_LIMIT": 2000,  # Files will be split into these chunks before being fed to the controller
 
-    "output_final_file_path": join(MAIN_DIR, "output", "perf2.csv"),
+    "output_final_file_path": join(MAIN_DIR, "completed", "perf2.csv"),
     "CSV_OUTPUT_DELIMITER": ',',
     # Set this to the character you want as the delimiter, will apply to the output_file_final_path
 
@@ -68,7 +68,7 @@ RUN_CONFIG = {
     # Whether to use Threads or Processes
     "PARALLEL_PREFER": "processes",
     # how many requests per second we should make at the most
-    "REQUEST_RATE_LIMIT": 10000,
+    "REQUEST_RATE_LIMIT": 2000,
 
     # Force new visit if a website have already been visited in a former run
     "force_new_visit": False,
@@ -78,6 +78,139 @@ RUN_CONFIG = {
 
     ## Chrome options
     "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36",
+
+    # ANTI-BLOCKING (aiohttp request layer -- url_visitor.py)
+    # Rotate a real desktop browser User-Agent (one per domain, stable across that
+    # domain's own retries) and send browser-like Accept/Sec-Fetch-* headers on the
+    # aiohttp pass. Set False to revert to the single static USER_AGENT above with
+    # no extra headers.
+    "ENABLE_UA_ROTATION": True,
+    "UA_POOL": [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    ],
+    # On HTTP 429: retry up to this many times, honoring a numeric Retry-After
+    # header when present, else exponential backoff. Set to 0 to disable.
+    "MAX_RETRIES_429": 3,
+    # On HTTP 503 or a Cloudflare edge error (520-527, 530): short-backoff retries.
+    # Set to 0 to disable.
+    "MAX_RETRIES_5XX": 2,
+    # base for the exponential backoff: delay = BACKOFF_BASE_SECONDS * 2**(retry_n-1)
+    "BACKOFF_BASE_SECONDS": 1,
+    # WAVE 5: transient connection-level failures (raised as exceptions before
+    # any HTTP response is received -- refused/reset/dropped connection,
+    # server disconnect) get this many backoff-and-retry attempts within the
+    # same request, mirroring the 429/5xx retry above. Deliberately does NOT
+    # cover DNS resolution errors (a domain that doesn't resolve is genuinely
+    # dead, not transient) or the request-level TimeoutError (already burned
+    # the full MINUTES_TO_TIMEOUT budget once; doubling that wait doesn't
+    # help and just slows the whole batch down). Set to 0 to disable.
+    "MAX_RETRIES_CONNECTION": 2,
+    # A 403 (or a Cloudflare status that survives the retries above) gets one
+    # real-browser attempt via request_full_file_with_browser() before being
+    # classified as an error, reusing the existing to_revisit_with_js pipeline
+    # so a successful browser fetch is reclassified normally. Set False to
+    # revert to classifying these as errors immediately (old behaviour).
+    "ENABLE_BROWSER_ON_403": True,
+
+    # WAVE 4 (classification_parked.py / formatting.py): interstitial/infra gate,
+    # empty-page floor, reclassify-on-browser-success, render timeout.
+    # No proxies/stealth here -- genuine Cloudflare/Vercel JS challenges are left
+    # unsolved on purpose; this wave is about not mis-labeling them as content.
+
+    # 1. Interstitial/infra gate: a fetched page (from either request pass) showing
+    # any of these signals is a challenge/block page, not real content, and is
+    # routed to No content > Errors > Blocked/Undetermined -- this OVERRIDES the
+    # park/ML classifier (including ml_feat_blocked), so a Cloudflare page whose
+    # body contains the word "blocked" is caught here, not filed as Content>Blocked.
+    "ENABLE_INTERSTITIAL_GATE": True,
+    # WAVE 7: split from the old single BLOCKED_STATUS_CODES so
+    # formatting.py's classification gate can route each terminal status to
+    # the right proxy-actionable lv3 bucket -- BOT_BLOCKED_STATUS_CODES are
+    # the ones a residential/rotating proxy retry can plausibly get past
+    # (rate-limit or bot-challenge responses); ORIGIN_ERROR_STATUS_CODES are
+    # Cloudflare's own "origin server unreachable" edge errors, which no
+    # amount of proxying fixes since the block isn't on the client side.
+    # BLOCKED_STATUS_CODES stays as their union: it still drives the
+    # detect_interstitial() status-code leg and the BLOCKED_STATUS_PATTERN
+    # browser-fallback trigger in classification_parked.py, where the only
+    # question is "is this status blocked-ish at all" -- the bot/origin split
+    # itself only matters downstream, in formatting.py's lv3 gate.
+    "BOT_BLOCKED_STATUS_CODES": [403, 429, 503],
+    "ORIGIN_ERROR_STATUS_CODES": [520, 521, 522, 523, 524, 525, 526, 527, 530],
+    "BLOCKED_STATUS_CODES": [403, 429, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530],
+    "CHALLENGE_TITLES": [
+        "Attention Required! | Cloudflare",
+        "Just a moment",
+        "Web server is down",
+        "Cloudflare Tunnel error",
+        "Vercel Security Checkpoint",
+        "403 Forbidden",
+        "503 Service Unavailable",
+    ],
+    "CHALLENGE_BODY_MARKERS": [
+        "you have been blocked",
+        "Performing security verification",
+        "Checking your browser",
+        "Ray ID:",
+        "Incapsula incident ID",
+        "cf-ray",
+        "Error code 521",
+        "Error 1033",
+        "Enable JavaScript and cookies to continue",
+    ],
+
+    # 2. Empty-page gate: a page with this few visible words can't be meaningful
+    # content regardless of flag_js_found/iframe/ML signals -- applied as a floor
+    # that wins over those signals (previously the emptiness check was skipped
+    # entirely whenever flag_js_found or an iframe was present).
+    "ENABLE_EMPTY_WORD_FLOOR": True,
+    "EMPTY_WORD_THRESHOLD": 10,
+
+    # 3. Reclassification: if a browser-fallback fetch comes back with this many
+    # words or more and isn't caught by the interstitial gate, treat it as real
+    # content even though the initial request errored.
+    "ENABLE_RECLASSIFY_ON_BROWSER_SUCCESS": True,
+    "REAL_CONTENT_WORD_THRESHOLD": 100,
+
+    # 4. Render timeout: Selenium page-load timeout for the browser-fallback pass
+    # (previously only an implicit 15s wait was set, with no explicit page-load
+    # timeout at all). A timeout is treated as undetermined -- it does not
+    # overwrite the row's existing classification.
+    "RENDER_TIMEOUT_SECONDS": 30,
+
+    # WAVE 5 (classification_parked.py / formatting.py): ISP/hosting placeholder
+    # gate, archive.org-redirect gate. Both mirror the interstitial gate above --
+    # checked before the park/ML classifier, so they can never be filed as
+    # Content/Parked.
+
+    # 5. ISP/hosting placeholder gate: a domain with nothing configured often
+    # still returns a plain HTTP 200 with the hosting provider's own generic
+    # "can't be displayed" page instead of a 4xx/5xx. From the HTTP layer alone
+    # this looks like a normal successful response, and its few words of
+    # boilerplate can get the ML park-classifier to call it "Parked Notice
+    # Individual Content". Kept deliberately narrow/specific (exact known
+    # provider boilerplate, not generic phrases) to avoid catching real error
+    # pages that are themselves meaningful custom content.
+    "ENABLE_ISP_PLACEHOLDER_GATE": True,
+    "ISP_PLACEHOLDER_BODY_MARKERS": [
+        "Error. Page cannot be displayed. Please contact your service provider for more details.",
+    ],
+
+    # 6. Archive.org-redirect gate: a domain that hard-redirects to a specific
+    # web.archive.org (Wayback Machine) snapshot isn't serving its own content
+    # -- the words on that page belong to whoever archived it, not to this
+    # domain, and the domain itself is effectively inactive. Reuses the
+    # existing registrar-link detection (park_service ends up "web.archive.org"
+    # via the "web"/".archive.org" entry in hosting_companies_with_tld.csv) so
+    # this fires whenever that specific match happens, instead of letting it
+    # fall through to "Parked Notice Registrar" or counting the archived page's
+    # word count as if it were live content.
+    "ENABLE_ARCHIVE_REDIRECT_GATE": True,
+    "ARCHIVE_REDIRECT_DOMAINS": ["archive.org"],
 
     # path where url pickle are saved (if debug-mode=True)
     "PATH_URL_SAVE": join(MAIN_DIR, "inter", "urls"),
@@ -136,7 +269,7 @@ RUN_CONFIG = {
     "DBHOST": "dbpostgres",  # hostname or ip address of the db server
     "DBPORT": '5432',  # db access port
     "DBUSER": "postgres",  # db username
-    "DBPASS": "password",  # db password
+    "DBPASS": "/aPh.I6:Eda!YmmWUD}2",  # db password
 
     # DEBUGGING
     "VERBOSE_DEBUGGING": False,  # allows printing of extra debugging information while developing.

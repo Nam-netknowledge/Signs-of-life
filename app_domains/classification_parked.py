@@ -69,6 +69,10 @@ BASIC_TAGS = ["td", "tr", "p", "article", "footer", "li", "span", "noscript"]
 BASICCONTENT_ELEMENTS = dict(zip(BASIC_TAGS, [True] * len(BASIC_TAGS)))
 
 LIMIT_PRINT_LINKS = 50
+MAX_EXTERNAL_LINKS = 200  # cap on external links stored per page, for the DB 'links' column
+# 403, or a Cloudflare-range status (429/503/520-527/530) that survived the
+# request-layer retries in url_visitor.py -- see ENABLE_BROWSER_ON_403 in config.py
+BLOCKED_STATUS_PATTERN = re.compile(r"status code\s*:\s*(403|429|503|52[0-7]|530)\b")
 THRESH_LETTERS_FULL_JS = 500
 THRESH_JS_PREVALANT = 0.5  # 50 % of the page length
 
@@ -87,6 +91,17 @@ LIST_SPE_WORDS = ["sale", "blocked", "construction", "expired", "index_of", "oth
 FT = Featurer(RUN_CONFIG) # features building
 PD = Predictor(RUN_CONFIG) # ML prediction
 
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def extract_title(html):
+    """Pull the <title> text out of a raw HTML string, or None if there isn't one"""
+    if not html:
+        return None
+    m = TITLE_RE.search(html)
+    if not m:
+        return None
+    return re.sub(r"\s+", " ", m.group(1)).strip()
 
 
 def ignore_same_domain_redirection(resu):
@@ -521,6 +536,9 @@ class PageParkClassifier():
         self.registrar_found = None
         self.is_redirected_to_registrar = None
 
+        # Outbound links
+        self.external_links = []
+
         # JS
         self.document_write = None
         self.to_revisit_with_js = None
@@ -635,6 +653,24 @@ class PageParkClassifier():
                 self.registrar_found = True
                 self.is_redirected_to_registrar = True
 
+    def identify_external_links(self):
+        """Capture the landing page's outbound links: different domain than the
+        page itself, deduplicated, capped at MAX_EXTERNAL_LINKS"""
+        all_links = self.html_data["all_links"]
+        own_domain = link_to_domain(self.url)
+        seen = set()
+        external = []
+        for lk in all_links:
+            if link_to_domain(lk) == own_domain:
+                continue
+            if lk in seen:
+                continue
+            seen.add(lk)
+            external.append(lk)
+            if len(external) >= MAX_EXTERNAL_LINKS:
+                break
+        self.external_links = external
+
     def detect_javascript_requirement(self):
         """Detect clues that a browser visit is necessary"""
         html = self.html
@@ -680,9 +716,19 @@ class PageParkClassifier():
         self.js_or_iframe_found = False
         if flag_js_found or flag_iframe:
             self.js_or_iframe_found = True
-        # Empty page
-        self.pred_is_empty = (n_unique_words <= THRESHOLD_EMPTY) and (not self.js_or_iframe_found) and (
+        # Empty page: strict check (no JS/iframe, no links, near-zero unique words)
+        ind_strict_empty = (n_unique_words <= THRESHOLD_EMPTY) and (not self.js_or_iframe_found) and (
                 len(all_links) == 0)
+        # WAVE 4: unconditional word-count floor -- a page this short can't be
+        # meaningful content no matter what flag_js_found/iframe say, so this
+        # applies regardless of js_or_iframe_found/all_links (previously the
+        # strict check above was the ONLY path to pred_is_empty, and it was
+        # skipped entirely whenever a JS/iframe flag was set -- this is what let
+        # near-blank image-parking pages with a flag_js_found=True land in
+        # "High content" instead of empty/not-used).
+        ind_word_floor_empty = RUN_CONFIG["ENABLE_EMPTY_WORD_FLOOR"] and (self.n_words is not None) and (
+                self.n_words <= RUN_CONFIG["EMPTY_WORD_THRESHOLD"])
+        self.pred_is_empty = bool(ind_strict_empty or ind_word_floor_empty)
         plog2.it(f"pred_is_empty : {self.pred_is_empty}")
 
     def identify_parking_pattern(self):
@@ -704,12 +750,24 @@ class PageParkClassifier():
         if registrar_found:
             if self.is_redirected_to_registrar:
                 registrar_found = True
-            elif self.pred_ml_park:
-                registrar_found = True
+            # FIX: the two checks below exist specifically to catch a
+            # registrar_found=True that came from an incidental link match
+            # (e.g. a WordPress theme's footer credit link to
+            # wordpress.com/themes/..., not the domain actually being hosted/
+            # parked there) on a page that's clearly substantial real content.
+            # They must run BEFORE pred_ml_park, not after -- pred_ml_park is
+            # itself just another (imperfect) signal, and having it confirm
+            # registrar_found unconditionally made these two overrides
+            # unreachable dead code whenever the ML model agreed.
+            # is_redirected_to_registrar (direct redirect to the registrar's
+            # own domain) stays first/decisive since that's a much stronger,
+            # more literal signal than a word or tag count.
             elif self.n_words > THRESHOLD_MIN_DISPLAYED_WORDS_FOR_PATTERNS:  # non trivial page with no parking pattern
                 registrar_found = False
             elif n_tags > THRESHOLD_N_TAGS:  # generated by website builder
                 registrar_found = False
+            elif self.pred_ml_park:
+                registrar_found = True
 
         self.registrar_found = registrar_found
         plog2.it(f"registrar_found: {registrar_found}")
@@ -755,6 +813,7 @@ class PageParkClassifier():
             "source": self.source,
             "original_url": self.original_url,
             "to_sample": False,
+            "target_url": self.target_link,
 
             "is_redirected": False,
             "to_revisit_with_js": False,
@@ -766,7 +825,163 @@ class PageParkClassifier():
             resu["is_error"] = self.is_error
             resu["comment"] = self.comment
 
+        # ANTI-BLOCKING: a 403 (bot-blocked) or an unresolved Cloudflare/429/503
+        # status that survived the url_visitor.py request-layer retries gets one
+        # real-browser attempt instead of being classified as an error outright.
+        # Routes through the same to_revisit_with_js -> request_full_file_with_browser()
+        # -> single_page_classify_parking() pipeline already used for JS-heavy pages,
+        # so a successful fetch is reclassified normally (Content/etc.) rather than
+        # staying stamped with this error's status/comment.
+        if RUN_CONFIG["ENABLE_BROWSER_ON_403"] and isinstance(self.comment, str) \
+                and BLOCKED_STATUS_PATTERN.search(self.comment):
+            resu["to_revisit_with_js"] = True
+
         return resu
+
+    def detect_interstitial(self):
+        """WAVE 4: catch a challenge/infra interstitial (Cloudflare/Vercel/etc.)
+        BEFORE the content/park/ML classifier runs, so it can never be filed as
+        real content. Checked regardless of self.is_error, since the
+        browser-fallback pass marks a successfully-rendered challenge page as
+        is_error=False -- this is what lets ml_feat_blocked mistake a Cloudflare
+        "you have been blocked" page for real Content>Blocked without this gate.
+        Returns a short reason string if flagged, else None."""
+        if not RUN_CONFIG["ENABLE_INTERSTITIAL_GATE"]:
+            return None
+
+        # status code leg -- only available when self.comment still holds the
+        # request-layer "Error status code :NNN" text (url_visitor.py); a
+        # browser-fallback re-render doesn't carry this signal on its own
+        if isinstance(self.comment, str):
+            m = re.search(r"status code\s*:\s*(\d+)", self.comment)
+            if m and int(m.group(1)) in RUN_CONFIG["BLOCKED_STATUS_CODES"]:
+                return f"status_code:{m.group(1)}"
+
+        # title leg
+        title = extract_title(self.html)
+        if title:
+            title_lower = title.lower()
+            for t in RUN_CONFIG["CHALLENGE_TITLES"]:
+                if t.lower() in title_lower:
+                    return f"title:{t}"
+
+        # body marker leg
+        haystack = f"{self.txt or ''} {self.html or ''}".lower()
+        for marker in RUN_CONFIG["CHALLENGE_BODY_MARKERS"]:
+            if marker.lower() in haystack:
+                return f"body:{marker}"
+
+        return None
+
+    def gather_interstitial_result(self, reason):
+        """Result for a page caught by the interstitial gate: always No content,
+        never reaches the park/ML classifier. is_interstitial=True is what
+        formatting.py's final override keys off of.
+
+        WAVE 4: to_revisit_with_js mirrors gather_error_result()'s ANTI-BLOCKING
+        browser-fallback trigger rather than hardcoding False. Without this, a
+        status-code-only match (e.g. a bare 429/503/522 with no Cloudflare/
+        challenge branding in the body -- mckinneyoem.org, netstrategy.au,
+        clarence-dillon.asia, ecovillagecostarica.org) would short-circuit BEFORE
+        gather_error_result() ever runs, permanently blocking the browser retry
+        that fix #3 (reclassify_if_browser_recovered) depends on -- these domains
+        would stay stuck as Blocked/Undetermined forever instead of being given
+        the chance to prove out as genuine content. A page that's genuinely a
+        Cloudflare/Vercel challenge (title/body legs matched) will simply get
+        re-flagged as interstitial on the browser-rendered pass too (see
+        gather_normal_result()'s is_interstitial=False, which only applies when
+        the re-render turns out clean)."""
+        resu = {
+            "url": self.url,
+            "source": self.source,
+            "original_url": self.original_url,
+            "to_sample": False,
+            "target_url": self.target_link,
+            "is_redirected": False,
+            "to_revisit_with_js": False,
+            "pred_is_parked": False,
+            "is_error": True,
+            "comment": f"Interstitial/challenge detected ({reason})",
+            "is_interstitial": True,
+        }
+        if RUN_CONFIG["ENABLE_BROWSER_ON_403"] and isinstance(self.comment, str) \
+                and BLOCKED_STATUS_PATTERN.search(self.comment):
+            resu["to_revisit_with_js"] = True
+        return resu
+
+    def detect_isp_placeholder(self):
+        """WAVE 5: catch a hosting/ISP default "page cannot be displayed"
+        placeholder returned with a normal HTTP 200 -- the domain has nothing
+        configured, but from the HTTP layer alone this looks like a successful
+        response, and its few words of boilerplate can fool the ML
+        park-classifier into calling it a parked-notice page. Mirrors
+        detect_interstitial()'s body-marker leg; checked at the same early
+        point so it never reaches the park/ML classifier. Returns a short
+        reason string if flagged, else None."""
+        if not RUN_CONFIG["ENABLE_ISP_PLACEHOLDER_GATE"]:
+            return None
+
+        haystack = f"{self.txt or ''} {self.html or ''}".lower()
+        for marker in RUN_CONFIG["ISP_PLACEHOLDER_BODY_MARKERS"]:
+            if marker.lower() in haystack:
+                return f"body:{marker}"
+
+        return None
+
+    def gather_isp_placeholder_result(self, reason):
+        """Result for a hosting/ISP default placeholder page returned with a
+        plain 200: not real content, not a park/registrar notice -- routes to
+        No content/Errors like gather_interstitial_result()."""
+        return {
+            "url": self.url,
+            "source": self.source,
+            "original_url": self.original_url,
+            "to_sample": False,
+            "target_url": self.target_link,
+            "is_redirected": False,
+            "to_revisit_with_js": False,
+            "pred_is_parked": False,
+            "is_error": True,
+            "comment": f"ISP/hosting placeholder detected ({reason})",
+            "is_isp_placeholder": True,
+        }
+
+    def is_archived_redirect(self):
+        """WAVE 5: true if this page's redirect target is a specific
+        web.archive.org (Wayback Machine) snapshot rather than the domain's
+        own site. Piggybacks on identify_registrar()'s existing detection
+        (park_service ends up "web.archive.org" via the "web"/".archive.org"
+        entry in hosting_companies_with_tld.csv) -- called right after
+        identify_registrar() in classify(), before validate_registrar() or
+        the ML/park pipeline runs, so this never falls through to Parked
+        Notice Registrar or has its archived word count counted as this
+        domain's own content."""
+        if not RUN_CONFIG["ENABLE_ARCHIVE_REDIRECT_GATE"]:
+            return False
+        if not self.is_redirected_to_registrar or not self.park_service:
+            return False
+        park_service_lower = self.park_service.lower()
+        return any(park_service_lower.endswith(d) for d in RUN_CONFIG["ARCHIVE_REDIRECT_DOMAINS"])
+
+    def gather_archived_redirect_result(self):
+        """Result for a domain that redirects to an archived snapshot instead
+        of serving its own content: No content/inactive. Deliberately does NOT
+        include n_words -- the archived page's word count belongs to whoever
+        archived it, not to this domain, so it must not be counted as this
+        domain's content."""
+        return {
+            "url": self.url,
+            "source": self.source,
+            "original_url": self.original_url,
+            "to_sample": False,
+            "target_url": self.target_link,
+            "is_redirected": True,
+            "to_revisit_with_js": False,
+            "pred_is_parked": False,
+            "is_error": True,
+            "comment": f"Redirected to archived snapshot ({self.park_service})",
+            "is_archived_redirect": True,
+        }
 
     def gather_normal_result(self):
         """Gather output result in case of normal page"""
@@ -777,6 +992,34 @@ class PageParkClassifier():
             "to_sample": self.to_sample,
             "source": self.source,
             "original_url": self.original_url,
+
+            # WAVE 4 root-cause fix for the reclassification gap: this dict never
+            # set is_error/comment before, so when it's used to overwrite an
+            # originally-erroring row during consolidate_original_and_js_rendered_
+            # results()'s per-key merge, "is_error" simply wasn't among the
+            # overwritten keys and the row's stale is_error=True (from before the
+            # browser fallback) survived untouched -- formatting.py kept routing it
+            # to No content/Errors no matter how good the recovered content was.
+            "is_error": False,
+            "comment": None,
+
+            # WAVE 4: explicit False (not just "absent"), so that
+            # consolidate_original_and_js_rendered_results()'s per-key merge
+            # actually clears a stale is_interstitial=True left over from the
+            # original failed pass (which can be flagged by status code alone --
+            # see gather_interstitial_result()) once the browser-rendered page
+            # turns out to be clean, non-challenge content. Without this key
+            # present here, the merge loop has nothing to overwrite the old
+            # True with, and reclassify_if_browser_recovered()'s own
+            # is_interstitial guard would then wrongly keep the row stuck as
+            # Blocked/Undetermined.
+            "is_interstitial": False,
+
+            # WAVE 5: same reasoning as is_interstitial above -- explicit False
+            # so the browser-fallback merge clears a stale flag from the
+            # original failed pass once the re-render turns out clean.
+            "is_isp_placeholder": False,
+            "is_archived_redirect": False,
 
             # content data
             "flag_iframe": self.html_data["flag_iframe"],
@@ -794,6 +1037,9 @@ class PageParkClassifier():
             # registrar
             "park_service": self.park_service,
             "registrar_found": self.registrar_found,
+
+            # outbound links
+            "links": json.dumps(self.external_links),
 
             # javascript
             "document_write": self.document_write,
@@ -873,7 +1119,22 @@ class PageParkClassifier():
         """Parking classification logic: collecting clues, classifying, validating some clues"""
         resu = {}
         try:
-            if self.is_error:
+            interstitial_reason = self.detect_interstitial()
+            # WAVE 5: checked at the same early point as the interstitial gate
+            # (only reached when that one didn't already match), so an ISP/
+            # hosting placeholder never reaches the park/ML classifier either.
+            isp_placeholder_reason = None if interstitial_reason else self.detect_isp_placeholder()
+            if interstitial_reason:
+                # WAVE 4: challenge/infra page -- never reaches the park/ML
+                # classifier, regardless of is_error (catches both a hard-blocked
+                # first pass AND a browser-fallback re-render that "succeeded" by
+                # fetching the challenge page itself)
+                resu = self.gather_interstitial_result(interstitial_reason)
+
+            elif isp_placeholder_reason:
+                resu = self.gather_isp_placeholder_result(isp_placeholder_reason)
+
+            elif self.is_error:
                 # DNS or HTTP error page
                 resu = self.gather_error_result()
 
@@ -885,31 +1146,41 @@ class PageParkClassifier():
 
                 self.identify_registrar()
 
-                self.detect_javascript_requirement()
-
-                if self.is_redirection_necessary():
-                    # the current page is irrelevant for classification
-                    resu = self.gather_tempo_redirection_result()
+                if self.is_archived_redirect():
+                    # WAVE 5: redirected to a specific archive.org snapshot --
+                    # not this domain's own content, checked before the
+                    # ML/park pipeline so it never falls through to Parked
+                    # Notice Registrar or has the archived page's word count
+                    # counted as this domain's content.
+                    resu = self.gather_archived_redirect_result()
                 else:
-                    #
-                    self.ml_classification()
+                    self.identify_external_links()
 
-                    self.identify_empty_page()
+                    self.detect_javascript_requirement()
 
-                    self.identify_parking_pattern()
-
-                    self.validate_registrar()
-
-                    # parking conclusion
-                    if self.registrar_found or self.kw_parked or self.pred_is_empty or self.pred_ml_park:
-                        self.pred_is_parked = True
+                    if self.is_redirection_necessary():
+                        # the current page is irrelevant for classification
+                        resu = self.gather_tempo_redirection_result()
                     else:
-                        self.pred_is_parked = False
+                        #
+                        self.ml_classification()
 
-                    self.validate_javascript_requirement()
+                        self.identify_empty_page()
 
-                    # gather results
-                    resu = self.gather_normal_result()
+                        self.identify_parking_pattern()
+
+                        self.validate_registrar()
+
+                        # parking conclusion
+                        if self.registrar_found or self.kw_parked or self.pred_is_empty or self.pred_ml_park:
+                            self.pred_is_parked = True
+                        else:
+                            self.pred_is_parked = False
+
+                        self.validate_javascript_requirement()
+
+                        # gather results
+                        resu = self.gather_normal_result()
 
         except Exception as e:
 
@@ -990,6 +1261,32 @@ def consolidate_original_and_js_rendered_results(preds, preds_js):
                 rf["is_js_rendered_results"] = False
 
     return preds
+
+
+def reclassify_if_browser_recovered(resu):
+    """WAVE 4: if a browser-fallback fetch (is_js_rendered_results=True) found
+    substantial, non-interstitial content, it's real content even though the
+    initial request errored -- clear the error so it flows through to normal
+    classification (Content/etc.) instead of staying stamped as an error.
+    Safety net alongside the gather_normal_result() root-cause fix: this catches
+    the case regardless of which code path produced the merged n_words."""
+    if not resu.get("is_js_rendered_results"):
+        return resu
+    if resu.get("is_interstitial"):
+        return resu
+    # WAVE 5: same reasoning -- neither an ISP/hosting placeholder nor a
+    # redirect to an archived snapshot is real content, regardless of word
+    # count, so this recovery path must not clear their error state either.
+    if resu.get("is_isp_placeholder") or resu.get("is_archived_redirect"):
+        return resu
+    try:
+        n_words = float(resu.get("n_words"))
+    except (TypeError, ValueError):
+        return resu
+    if n_words >= RUN_CONFIG["REAL_CONTENT_WORD_THRESHOLD"]:
+        resu["is_error"] = False
+        resu["comment"] = None
+    return resu
 
 
 def predict_parking(documents):
@@ -1103,6 +1400,14 @@ def predict_parking(documents):
 
             # consolidation
             preds = consolidate_original_and_js_rendered_results(preds, preds_js)
+
+            # WAVE 4 safety net (defense-in-depth alongside the gather_normal_result()
+            # root-cause fix above): if the browser fallback came back with
+            # substantial content and wasn't caught by the interstitial gate, it's
+            # real content even though the initial request errored -- don't leave
+            # it stamped with the original error status.
+            if RUN_CONFIG["ENABLE_RECLASSIFY_ON_BROWSER_SUCCESS"]:
+                preds = [reclassify_if_browser_recovered(resu) for resu in preds]
 
     plog.it("doing last cleanup")
     # Remove redirection to same domain

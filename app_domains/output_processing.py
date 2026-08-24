@@ -125,7 +125,10 @@ def FilterColumns():
 	global DB_FIELDS
 	for col in TABLEAU_COLUMNS:
 		# add rejected columns to the list here
-		if col not in ["target_url", "url", "registrar_found", "kw_parked", "pred_is_empty", "js_or_iframe_found", "original_url", "category", "subcategory", "pred_is_parked", "is_error", "kw_park_notice", "original_url"]:
+		# 'date' is excluded here too: it's synthesized from the output filename
+		# (see ConstructSQLData), not a CSV column, and is hardcoded into the
+		# insert alongside 'filename' so it must never also come from DB_FIELDS.
+		if col not in ["target_url", "url", "registrar_found", "kw_parked", "pred_is_empty", "js_or_iframe_found", "original_url", "category", "subcategory", "pred_is_parked", "is_error", "kw_park_notice", "original_url", "date"]:
 			DB_FIELDS.add(col)
 	plog.it("TABLEAU_COLUMNS: {}".format(TABLEAU_COLUMNS))
 	plog.it("DB_FIELDS: {}".format(DB_FIELDS))
@@ -138,11 +141,22 @@ def ConstructSQLBase():
 		Get the columns from formatting.py and use that to construct the insert	
 	"""
 	global DB_FIELDS
-	msg = "insert into signs_of_life_crawler (filename, "
+	msg = "insert into signs_of_life_crawler (filename, date, "
 	for col in DB_FIELDS:
 		msg += col.lower() + ", "
 	msg = msg[:-2] + ") values "
 	return msg
+
+def RowDate(filename):
+	"""
+		The crawl date lives in the output filename prefix (YYYY-MM-DD-DB_...).
+		Fall back to today if the prefix isn't a valid date (e.g. a filename
+		that never got the date-prefixing in ProcessFile).
+	"""
+	try:
+		return date.fromisoformat(filename[:10]).isoformat()
+	except ValueError:
+		return date.today().isoformat()
 
 def ConstructSQLData(filename, row):
 	"""
@@ -153,6 +167,7 @@ def ConstructSQLData(filename, row):
 	#	sam_plog.it(f"Found error row: {row}", is_error=True)
 	#	return ''
 	msg = "($_${}$_$,".format(filename)
+	msg += "$_${}$_$,".format(RowDate(filename))
 	for col in DB_FIELDS:
 		if col == 'input_url':
 			if row[col] in input_urls:
@@ -214,7 +229,7 @@ def ProcessFile(file):
 		reader = csv.DictReader(csvfile, delimiter=sep)
 		for row in reader:
 			#plog.it(row)
-			if len(qstr) > 10000:
+			if len(qstr) > 5000000:
 				qlist.append(ConstructSQLTail(qstr))
 				qstr = qbase
 			# add to the query_string for this row
@@ -356,6 +371,7 @@ def WriteToDB(qlist):
 	for qstr in qlist:
 		try:
 			cur = db.cursor()
+			qstr = qstr.replace("$_$null$_$", "null")
 			cur.execute(qstr)
 			db.commit()
 			cur.close()
