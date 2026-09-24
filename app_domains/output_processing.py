@@ -2,9 +2,15 @@
 import base64
 from config import RUN_CONFIG
 import csv
-from formatting import TABLEAU_COLUMNS 
+from formatting import TABLEAU_COLUMNS
 import psycopg2 as pg
 import sys
+# Some crawled pages (e.g. link-heavy/spam pages) produce a 'links' cell well
+# past Python's default 131072-byte csv field limit, raising
+# "_csv.Error: field larger than field limit" in ProcessFile's DictReader loop.
+# Unrelated to the n_words/n_letter/tag_quantity fix below, but found while
+# testing chunk 14 and needed for that file to insert at all.
+csv.field_size_limit(sys.maxsize)
 from os import listdir
 from os.path import isfile, join, dirname, abspath, basename
 from pathlib import Path
@@ -103,6 +109,27 @@ def ProcessFiles(outputfiles):
 			print("\n\tPROCESSING FILE: {}".format(file))
 			ProcessFile(file)
 	print("Finished scanning all files.")
+
+INT_COLUMNS_AS_TEXT = ('n_words', 'n_letter', 'tag_quantity')
+
+def CoerceIntColumn(value):
+	"""
+	n_words/n_letter/tag_quantity round-trip through a pandas dataframe upstream
+	(in main_domains.py), which upcasts an otherwise-integer column to float64
+	as soon as any row is missing a value, so the CSV can contain "5465.0"
+	instead of "5465". Whatever type these columns end up as in a given DB
+	(they're varchar in this schema, but the same ".0" values still trip
+	"invalid input syntax for integer" if/when they're integer), always emit a
+	clean digit string. Missing values map to the 'null' sentinel that
+	WriteToDB replaces with a bare SQL null -- never emit '', which fails the
+	same way "5465.0" does.
+	"""
+	if value is None or str(value).strip() in ('', 'nan', 'None'):
+		return 'null'
+	try:
+		return str(int(float(value)))
+	except (TypeError, ValueError):
+		return 'null'
 
 def ConvertBool(csvbit):
 	"""csv is sending in various values for bool (eg 1.0, "1.0", True and so on), but python is converting everything to true and null to false.
@@ -229,7 +256,10 @@ def ProcessFile(file):
 		reader = csv.DictReader(csvfile, delimiter=sep)
 		for row in reader:
 			#plog.it(row)
-			if len(qstr) > 5000000:
+			for _c in INT_COLUMNS_AS_TEXT:
+				if _c in row:
+					row[_c] = CoerceIntColumn(row[_c])
+			if len(qstr) > 500000:
 				qlist.append(ConstructSQLTail(qstr))
 				qstr = qbase
 			# add to the query_string for this row
@@ -371,6 +401,7 @@ def WriteToDB(qlist):
 	for qstr in qlist:
 		try:
 			cur = db.cursor()
+			cur.execute("SET statement_timeout = '120s'")
 			qstr = qstr.replace("$_$null$_$", "null")
 			cur.execute(qstr)
 			db.commit()
