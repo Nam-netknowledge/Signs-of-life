@@ -27,9 +27,14 @@ crawl_dir () {
             mkdir -p $input_folder/${CONTAINER_NAME}
             mv "$file" $input_folder/${CONTAINER_NAME}
             python -u app_domains/main_domains.py -container_name="${CONTAINER_NAME}"
-            mkdir -p done
-            mv "$input_folder/${CONTAINER_NAME}/$BASENAME" done/
-            rm  $input_folder/${CONTAINER_NAME}/$BASENAME.chunk*
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+                mkdir -p done
+                mv "$input_folder/${CONTAINER_NAME}/$BASENAME" done/
+                rm  $input_folder/${CONTAINER_NAME}/$BASENAME.chunk*
+            else
+                echo -e "* ${RED}main_domains.py exited with code ${EXIT_CODE} for [${BASENAME}] - leaving file and chunks in place for retry next cycle.${NC}"
+            fi
         else
             echo -e "* ${RED}no URL found in file [${file}] - skipping.${NC}"
         fi
@@ -46,10 +51,15 @@ crawl_dir () {
                 # Execute if a non-chunk is not found
                 echo "${GREEN}File found in processing $BASENAME - Crawling. ${NC}"
                 python -u app_domains/main_domains.py -container_name="${CONTAINER_NAME}"
-                mkdir -p done
-                mv "$input_folder/${CONTAINER_NAME}/$BASENAME" done/
-                rm  $input_folder/${CONTAINER_NAME}/$BASENAME.chunk*
-                ;;  
+                EXIT_CODE=$?
+                if [ $EXIT_CODE -eq 0 ]; then
+                    mkdir -p done
+                    mv "$input_folder/${CONTAINER_NAME}/$BASENAME" done/
+                    rm  $input_folder/${CONTAINER_NAME}/$BASENAME.chunk*
+                else
+                    echo -e "* ${RED}main_domains.py exited with code ${EXIT_CODE} for [${BASENAME}] - leaving file and chunks in place for retry next cycle.${NC}"
+                fi
+                ;;
         esac
     done
     echo -e "\n\n*****************\n\n"
